@@ -1,0 +1,739 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  白狼 · 日常工作待办管理系统 — Prisma Schema
+//  对应文档：《01-需求规格说明书》v1.1  §5 数据模型
+//
+//  约定：
+//   · 主键统一 UUID（String @db.Uuid）——API 不暴露自增序号，也避免 JS BigInt 序列化坑
+//   · 所有时间列用 timestamptz（存 UTC，显示时按 Asia/Shanghai 转换）
+//   · 软删除统一 `deleted_at`（NULL = 未删除），业务表全部带 created_at / updated_at
+//   · 表名/列名数据库侧用 snake_case（@map / @@map），代码侧用 camelCase
+//   · “名称唯一”类约束（分类名、标签名）用「部分唯一索引」实现，只约束未删除行，
+//     因此不在 schema 里写 @unique，而是在迁移 SQL 中创建（见 prisma/migrations）
+// ═══════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  枚举
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 角色（需求 §2：成员 / 管理员）
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+/// 账号状态（FR-1.7 用户管理：禁用后无法登录但历史数据保留）
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+/// 主题模式（FR-9.1 亮/暗色切换，三态）
+enum ThemeMode {
+  LIGHT
+  DARK
+  SYSTEM
+}
+
+/// 默认首页视图（FR-9.6 默认偏好）
+enum ViewType {
+  DASHBOARD
+  LIST
+  BOARD
+  CALENDAR
+}
+
+/// 优先级（FR-2.2 / §3.1：紧急/高/中/低，颜色区分）
+/// 说明：优先级固定四级（语义与排序依赖它），不放进可配置字典；
+///      可配置的“类型”用 String + dictionaries 表实现。
+enum WorkItemPriority {
+  URGENT
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// 工作项关联类型（FR-2.12 关联关系 / 前置依赖，P2）
+enum WorkItemRelationType {
+  RELATED
+  BLOCKS
+  BLOCKED_BY
+}
+
+/// 通知类型（FR-8.2 通知场景）
+enum NotificationType {
+  ASSIGNED // 被指派
+  MENTIONED // 被 @
+  COMMENTED // 收到评论
+  STATUS_CHANGED // 状态变更
+  DUE_SOON // 即将到期
+  OVERDUE // 已逾期
+  SYSTEM // 系统消息
+}
+
+/// 变更来源：区分“人工操作”与“AI 助手操作”（FR-12.12 助手操作审计）
+enum ChangeSource {
+  MANUAL
+  ASSISTANT
+  SYSTEM
+}
+
+// ── AI 助手相关枚举（FR-12 / §16）─────────────────────────────────────────
+
+/// 消息角色（§16：system / user / assistant / tool）
+enum AssistantMessageRole {
+  SYSTEM
+  USER
+  ASSISTANT
+  TOOL
+}
+
+/// 操作卡状态机（§16.4）
+enum AssistantActionStatus {
+  PENDING // 待用户确认
+  CONFIRMED // 已确认，执行中
+  REJECTED // 用户取消
+  EXECUTED // 已执行
+  FAILED // 执行失败
+  UNDONE // 已撤销
+  EXPIRED // 超过 10 分钟未确认，自动作废
+}
+
+/// 工具风险级别（§16.3：read 直接执行；write 必须确认；dangerous 不注册）
+enum AssistantRiskLevel {
+  READ
+  WRITE
+}
+
+/// 自动执行级别（FR-12.9：默认任何写操作都要确认）
+enum AssistantAutoExecute {
+  ALWAYS_CONFIRM
+  LOW_RISK_AUTO
+}
+
+/// 隐私模式（FR-12.19：只发标题，不回传正文与评论）
+enum AssistantPrivacyMode {
+  FULL
+  TITLE_ONLY
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  一、账号与认证  （FR-1）
+// ═══════════════════════════════════════════════════════════════════════════
+
+model User {
+  id             String     @id @default(uuid()) @db.Uuid
+  username       String     @unique @db.VarChar(50)
+  email          String?    @unique @db.VarChar(120)
+  /// 仅存哈希（bcrypt / argon2），绝不存明文（NFR §4.2）
+  passwordHash   String     @map("password_hash") @db.VarChar(100)
+  nickname       String     @db.VarChar(50)
+  avatarUrl      String?    @map("avatar_url") @db.VarChar(500)
+  role           UserRole   @default(MEMBER)
+  status         UserStatus @default(ACTIVE)
+  /// 登录失败计数与锁定（FR-1.8 登录保护）
+  failedAttempts Int        @default(0) @map("failed_attempts")
+  lockedUntil    DateTime?  @map("locked_until") @db.Timestamptz(3)
+  lastLoginAt    DateTime?  @map("last_login_at") @db.Timestamptz(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  preference             UserPreference?
+  refreshTokens          RefreshToken[]
+  categories             Category[]
+  savedViews             SavedView[]
+  createdWorkItems       WorkItem[]              @relation("WorkItemCreator")
+  assignedWorkItems      WorkItem[]              @relation("WorkItemAssignee")
+  statusLogs             WorkItemStatusLog[]
+  watchedItems           WorkItemWatcher[]
+  comments               Comment[]
+  uploadedAttachments    Attachment[]
+  notifications          Notification[]
+  auditLogs              AuditLog[]
+  assistantConversations AssistantConversation[]
+  assistantActions       AssistantAction[]
+  assistantSetting       AssistantSetting?
+  assistantUsage         AssistantUsageDaily[]
+
+  @@map("users")
+}
+
+/// 个人偏好（FR-9.2 主题持久化 / FR-9.6 默认视图与分页 / FR-8.7 通知开关）
+model UserPreference {
+  userId       String    @id @map("user_id") @db.Uuid
+  theme        ThemeMode @default(SYSTEM)
+  defaultView  ViewType  @default(DASHBOARD) @map("default_view")
+  pageSize     Int       @default(20) @map("page_size")
+  /// 各通知类型的开关，形如 { "DUE_SOON": true, "COMMENTED": false }
+  notifyConfig Json?     @map("notify_config")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+/// 刷新令牌（FR-1.3 会话保持 / FR-1.4 改密后全部会话失效）
+/// 只存 token 哈希；revoked_at 非空表示已失效
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash") @db.VarChar(128)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+  ip        String?   @db.VarChar(64)
+  userAgent String?   @map("user_agent") @db.VarChar(300)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  二、分类 / 标签 / 状态字典  （FR-3.1 状态字典、FR-6 标签与分类）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 分类 / 项目（FR-6.1）
+model Category {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(50)
+  color       String  @default("#1677ff") @db.VarChar(20)
+  sort        Int     @default(0)
+  description String? @db.VarChar(300)
+  ownerId     String? @map("owner_id") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  owner     User?      @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  workItems WorkItem[]
+
+  /// 部分唯一索引在迁移 SQL 中创建：name 在 deleted_at IS NULL 时唯一
+  @@index([deletedAt, sort])
+  @@map("categories")
+}
+
+/// 标签（FR-6.2），名称在未删除行中唯一
+model Tag {
+  id    String @id @default(uuid()) @db.Uuid
+  name  String @db.VarChar(30)
+  color String @default("#1677ff") @db.VarChar(20)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  workItems WorkItemTag[]
+
+  @@index([deletedAt])
+  @@map("tags")
+}
+
+/// 状态字典（FR-3.1）：待办 / 进行中 / 阻塞 / 待验收 / 已完成 / 已取消
+/// 说明：不设 deleted_at —— 被工作项引用的状态不允许删除（靠外键 RESTRICT 兜底），
+///      禁用某个状态请用 isDefault / sort 调整或直接改工作项。
+model WorkItemStatus {
+  id               String  @id @default(uuid()) @db.Uuid
+  name             String  @db.VarChar(30)
+  code             String  @unique @db.VarChar(30)
+  color            String  @default("#1677ff") @db.VarChar(20)
+  sort             Int     @default(0)
+  /// 终态（已完成 / 已取消）：进入终态记完成时间、进度置 100%（FR-3.9）
+  isFinal          Boolean @default(false) @map("is_final")
+  /// 新建工作项的默认状态
+  isDefault        Boolean @default(false) @map("is_default")
+  /// 允许的流转目标，形如 ["TODO","DOING","CANCELLED"]；为空表示自由流转（FR-3.6）
+  allowTransitions Json?   @map("allow_transitions")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  workItems WorkItem[]
+  logsFrom  WorkItemStatusLog[] @relation("StatusLogFrom")
+  logsTo    WorkItemStatusLog[] @relation("StatusLogTo")
+
+  @@index([sort])
+  @@map("work_item_statuses")
+}
+
+/// 系统字典（FR-11.1 字典管理：工作项类型、来源等可配置项；FR-11.2 系统参数）
+model Dictionary {
+  id       String  @id @default(uuid()) @db.Uuid
+  category String  @db.VarChar(30)
+  key      String  @db.VarChar(50)
+  value    String  @db.VarChar(100)
+  sort     Int     @default(0)
+  enabled  Boolean @default(true)
+  extra    Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([category, key])
+  @@map("dictionaries")
+}
+
+/// 保存的筛选视图（FR-5.7，如“本周待办”“领导交办”）
+model SavedView {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String   @db.VarChar(50)
+  viewType  ViewType @default(LIST) @map("view_type")
+  /// 完整筛选条件快照：{ keyword, statusIds, priority, tagIds, dueFrom, dueTo, ... }
+  query     Json
+  sort      Int      @default(0)
+  isDefault Boolean  @default(false) @map("is_default")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name])
+  @@map("saved_views")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  三、工作项（待办）核心  （FR-2 / §3.1 字段表）
+// ═══════════════════════════════════════════════════════════════════════════
+
+model WorkItem {
+  id          String           @id @default(uuid()) @db.Uuid
+  /// 人类可读编号，如 W-20261013-001（FR-2.13）
+  code        String           @unique @db.VarChar(30)
+  title       String           @db.VarChar(200)
+  /// Markdown 原文（决策：编辑方式 = Markdown）
+  description String?          @db.Text
+  /// 类型：字典 key（任务/需求/缺陷/会议/学习/其他），默认 task
+  type        String           @default("task") @db.VarChar(30)
+  priority    WorkItemPriority @default(MEDIUM)
+
+  statusId   String  @map("status_id") @db.Uuid
+  categoryId String? @map("category_id") @db.Uuid
+  creatorId  String  @map("creator_id") @db.Uuid
+  /// 负责人，默认当前用户（FR-2.2）；指派他人时触发通知
+  assigneeId String  @map("assignee_id") @db.Uuid
+
+  startAt     DateTime? @map("start_at") @db.Timestamptz(3)
+  dueAt       DateTime? @map("due_at") @db.Timestamptz(3)
+  /// 进入终态时自动写入，退出终态时清空（FR-3.9）
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(3)
+
+  estimateHours Decimal? @map("estimate_hours") @db.Decimal(7, 2)
+  actualHours   Decimal  @default(0) @map("actual_hours") @db.Decimal(7, 2)
+  /// 0–100，DB 侧有 CHECK 约束；状态改为已完成时置 100
+  progress      Int      @default(0)
+  /// 来源，如“领导交办”“线上反馈”（可配置字典）
+  source        String?  @db.VarChar(50)
+
+  isPinned       Boolean @default(false) @map("is_pinned")
+  isArchived     Boolean @default(false) @map("is_archived")
+  /// 预留：工作项嵌套（P2）。P1 的子任务用 checklist_items
+  parentId       String? @map("parent_id") @db.Uuid
+  /// 看板列内手动排序权重（FR-5.2）
+  sortWeight     Int     @default(0) @map("sort_weight")
+  /// 周期任务规则（FR-2.11，P2），如 RRULE 字符串
+  recurrenceRule String? @map("recurrence_rule") @db.VarChar(200)
+  /// 乐观锁版本号（FR-2.14 并发保护）
+  version        Int     @default(1)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  status   WorkItemStatus @relation(fields: [statusId], references: [id], onDelete: Restrict)
+  category Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  creator  User           @relation("WorkItemCreator", fields: [creatorId], references: [id], onDelete: Restrict)
+  assignee User           @relation("WorkItemAssignee", fields: [assigneeId], references: [id], onDelete: Restrict)
+
+  parent   WorkItem?  @relation("WorkItemHierarchy", fields: [parentId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  children WorkItem[] @relation("WorkItemHierarchy")
+
+  tags          WorkItemTag[]
+  checklists    ChecklistItem[]
+  comments      Comment[]
+  attachments   Attachment[]
+  statusLogs    WorkItemStatusLog[]
+  watchers      WorkItemWatcher[]
+  relationsFrom WorkItemRelation[]  @relation("RelationFrom")
+  relationsTo   WorkItemRelation[]  @relation("RelationTo")
+
+  /// 主力查询：列表（未删除 + 未归档 + 状态 + 截止时间）
+  @@index([deletedAt, isArchived, statusId, dueAt])
+  @@index([assigneeId, deletedAt])
+  @@index([creatorId, deletedAt])
+  @@index([categoryId, deletedAt])
+  @@index([priority, dueAt])
+  @@index([parentId])
+  @@index([deletedAt, updatedAt])
+  /// 模糊检索（FR-5.5 搜索 / AI 助手检索工具的底层依赖），依赖 pg_trgm 扩展
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([code(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("work_items")
+}
+
+/// 状态变更留痕（FR-3.8）：谁 / 何时 / 从什么到什么 / 备注
+model WorkItemStatusLog {
+  id           String       @id @default(uuid()) @db.Uuid
+  workItemId   String       @map("work_item_id") @db.Uuid
+  /// 新建时为 NULL
+  fromStatusId String?      @map("from_status_id") @db.Uuid
+  toStatusId   String       @map("to_status_id") @db.Uuid
+  operatorId   String       @map("operator_id") @db.Uuid
+  remark       String?      @db.VarChar(500)
+  /// 区分人工改 / 助手改（FR-12.12）—— 时间线上可显示“由 AI 助手修改”
+  source       ChangeSource @default(MANUAL)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  workItem   WorkItem        @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  fromStatus WorkItemStatus? @relation("StatusLogFrom", fields: [fromStatusId], references: [id], onDelete: SetNull)
+  toStatus   WorkItemStatus  @relation("StatusLogTo", fields: [toStatusId], references: [id], onDelete: Restrict)
+  operator   User            @relation(fields: [operatorId], references: [id], onDelete: Restrict)
+
+  @@index([workItemId, createdAt])
+  @@index([operatorId, createdAt])
+  @@map("work_item_status_logs")
+}
+
+/// 关注者（FR-2.9 关注后该工作项所有变动都通知我）
+model WorkItemWatcher {
+  workItemId String   @map("work_item_id") @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([workItemId, userId])
+  @@index([userId])
+  @@map("work_item_watchers")
+}
+
+/// 子任务 / 检查清单（FR-2.10）
+model ChecklistItem {
+  id         String  @id @default(uuid()) @db.Uuid
+  workItemId String  @map("work_item_id") @db.Uuid
+  content    String  @db.VarChar(300)
+  isDone     Boolean @default(false) @map("is_done")
+  sort       Int     @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workItemId, sort])
+  @@map("checklist_items")
+}
+
+/// 工作项 ↔ 标签（FR-6.3）
+model WorkItemTag {
+  workItemId String   @map("work_item_id") @db.Uuid
+  tagId      String   @map("tag_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([workItemId, tagId])
+  @@index([tagId])
+  @@map("work_item_tags")
+}
+
+/// 工作项之间的关联 / 依赖（FR-2.12，P2）
+model WorkItemRelation {
+  id        String               @id @default(uuid()) @db.Uuid
+  fromId    String               @map("from_id") @db.Uuid
+  toId      String               @map("to_id") @db.Uuid
+  type      WorkItemRelationType @default(RELATED)
+  createdAt DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  from WorkItem @relation("RelationFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to   WorkItem @relation("RelationTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@unique([fromId, toId, type])
+  @@index([toId])
+  @@map("work_item_relations")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  四、评论与附件  （FR-4 图文评论）
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Comment {
+  id          String       @id @default(uuid()) @db.Uuid
+  workItemId  String       @map("work_item_id") @db.Uuid
+  userId      String       @map("user_id") @db.Uuid
+  /// 引用回复（FR-4.9，一层嵌套）
+  parentId    String?      @map("parent_id") @db.Uuid
+  /// Markdown 原文 —— 唯一事实来源
+  contentMd   String       @map("content_md") @db.Text
+  /// 渲染后的 HTML 缓存（可为空；净化规则变更时需重算，因此不视为事实来源）
+  contentHtml String?      @map("content_html") @db.Text
+  /// 被 @ 的用户 id 数组（FR-4.8）
+  mentions    Json?
+  source      ChangeSource @default(MANUAL)
+
+  editedAt  DateTime? @map("edited_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  workItem    WorkItem     @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  user        User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  parent      Comment?     @relation("CommentReplies", fields: [parentId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  replies     Comment[]    @relation("CommentReplies")
+  attachments Attachment[]
+
+  @@index([workItemId, createdAt])
+  @@index([userId, createdAt])
+  @@index([parentId])
+  /// 评论正文模糊检索，依赖 pg_trgm 扩展
+  @@index([contentMd(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("comments")
+}
+
+/// 附件 / 图片（FR-4.3 图文混排、FR-4.6 附件、FR-4.10 上传安全）
+///
+/// 【设计说明 · 与文档 §5 的一处刻意偏差】
+/// 文档草案写的是多态的 (owner_type, owner_id)。此处改为两个可空外键
+/// (work_item_id, comment_id)，原因：
+///   1) 能建立真正的数据库外键，杜绝孤儿行；
+///   2) onDelete: Cascade 让“工作项彻底删除 → 附件记录级联清理”自动成立（FR-4.13），
+///      不必依赖定时任务扫孤儿；
+///   3) Prisma 能表达关系，`workItem.attachments` 可直接查询，应用层不用手写多态条件。
+/// 用 CHECK 约束保证“至多一个外键非空”（两个都为空 = 尚未绑定的暂存文件，见迁移 SQL）。
+/// 上传流程仍是两阶段：先落盘得到一条“两个外键都为空”的临时记录，业务提交后再绑定。
+model Attachment {
+  id         String  @id @default(uuid()) @db.Uuid
+  workItemId String? @map("work_item_id") @db.Uuid
+  commentId  String? @map("comment_id") @db.Uuid
+  uploaderId String  @map("uploader_id") @db.Uuid
+
+  fileName   String  @map("file_name") @db.VarChar(255)
+  /// 相对存储路径（UUID 重命名 + 年/月 分目录），绝不暴露物理绝对路径
+  storedPath String  @map("stored_path") @db.VarChar(500)
+  mimeType   String  @map("mime_type") @db.VarChar(120)
+  /// 字节数；上限 10MB，Int 足够
+  size       Int
+  width      Int?
+  height     Int?
+  thumbPath  String? @map("thumb_path") @db.VarChar(500)
+  /// 内容指纹，用于秒传与重复文件识别（可选）
+  sha256     String? @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  workItem WorkItem? @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  comment  Comment?  @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  uploader User      @relation(fields: [uploaderId], references: [id], onDelete: Restrict)
+
+  @@index([workItemId])
+  @@index([commentId])
+  @@index([uploaderId, createdAt])
+  /// 定时任务扫描未绑定的临时文件用
+  @@index([createdAt])
+  @@map("attachments")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  五、通知与审计  （FR-8 提醒通知、FR-11.3 操作日志）
+// ═══════════════════════════════════════════════════════════════════════════
+
+model Notification {
+  id       String           @id @default(uuid()) @db.Uuid
+  userId   String           @map("user_id") @db.Uuid
+  type     NotificationType
+  title    String           @db.VarChar(200)
+  content  String?          @db.Text
+  /// 关联对象（松散引用，不设外键）：work_item / comment / assistant_action ...
+  linkType String?          @map("link_type") @db.VarChar(30)
+  linkId   String?          @map("link_id") @db.Uuid
+  isRead   Boolean          @default(false) @map("is_read")
+  readAt   DateTime?        @map("read_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+/// 操作审计（FR-11.3；FR-12.12 助手操作同样进这里，用 source 区分）
+model AuditLog {
+  id         String       @id @default(uuid()) @db.Uuid
+  userId     String?      @map("user_id") @db.Uuid
+  /// 动作标识，如 work_item.create / work_item.change_status / assistant.confirm
+  action     String       @db.VarChar(50)
+  targetType String?      @map("target_type") @db.VarChar(30)
+  targetId   String?      @map("target_id") @db.Uuid
+  /// 变更详情：{ before: {...}, after: {...}, changed: ["statusId"] }
+  detail     Json?
+  ip         String?      @db.VarChar(64)
+  userAgent  String?      @map("user_agent") @db.VarChar(300)
+  source     ChangeSource @default(MANUAL)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([targetType, targetId])
+  @@index([action, createdAt])
+  @@index([source, createdAt])
+  @@map("audit_logs")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  六、AI 助手  （FR-12 / §16 详细设计）
+// ═══════════════════════════════════════════════════════════════════════════
+
+model AssistantConversation {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  title         String    @db.VarChar(100)
+  /// 钉住上下文，如 { "categoryId": "...", "statusIds": ["..."] }（§16.5）
+  pinnedContext Json?     @map("pinned_context")
+  messageCount  Int       @default(0) @map("message_count")
+  lastMessageAt DateTime? @map("last_message_at") @db.Timestamptz(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages AssistantMessage[]
+  actions  AssistantAction[]
+
+  @@index([userId, lastMessageAt])
+  @@map("assistant_conversations")
+}
+
+/// 会话消息。assistant 消息可能带 tool_calls；tool 消息是工具返回值
+model AssistantMessage {
+  id             String               @id @default(uuid()) @db.Uuid
+  conversationId String               @map("conversation_id") @db.Uuid
+  role           AssistantMessageRole
+  content        String?              @db.Text
+  /// 模型请求的工具调用：[{ id, name, arguments }]
+  toolCalls      Json?                @map("tool_calls")
+  /// TOOL 角色消息对应的调用 id
+  toolCallId     String?              @map("tool_call_id") @db.VarChar(64)
+
+  model        String? @db.VarChar(60)
+  tokensIn     Int?    @map("tokens_in")
+  tokensOut    Int?    @map("tokens_out")
+  latencyMs    Int?    @map("latency_ms")
+  finishReason String? @map("finish_reason") @db.VarChar(30)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  conversation AssistantConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  actions      AssistantAction[]
+
+  @@index([conversationId, createdAt])
+  @@map("assistant_messages")
+}
+
+/// ★ 待确认 / 已执行的操作 —— 助手安全模型的核心表（§16.4）
+/// 写入工具被调用时不执行，而是先落一条 PENDING，前端渲染“操作卡”，
+/// 用户点执行 → EXECUTED（记录 before/after 快照，支持撤销）；
+/// 点取消 → REJECTED；超过 10 分钟 → EXPIRED。
+model AssistantAction {
+  id             String  @id @default(uuid()) @db.Uuid
+  userId         String  @map("user_id") @db.Uuid
+  conversationId String? @map("conversation_id") @db.Uuid
+  messageId      String? @map("message_id") @db.Uuid
+
+  toolName  String                @map("tool_name") @db.VarChar(50)
+  /// 模型给出的工具参数（服务端已强校验）
+  arguments Json
+  riskLevel AssistantRiskLevel    @default(WRITE) @map("risk_level")
+  status    AssistantActionStatus @default(PENDING)
+
+  /// 执行前快照，撤销时按它回滚
+  beforeSnapshot Json?   @map("before_snapshot")
+  afterSnapshot  Json?   @map("after_snapshot")
+  result         Json?
+  error          String? @db.Text
+  /// 影响条数（批量操作如实报告，见 §16.4 硬性规则 4）
+  affectedCount  Int     @default(1) @map("affected_count")
+
+  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(3)
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  executedAt  DateTime? @map("executed_at") @db.Timestamptz(3)
+  undoneAt    DateTime? @map("undone_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation AssistantConversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  message      AssistantMessage?      @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([status, userId])
+  @@index([conversationId, createdAt])
+  @@index([expiresAt])
+  @@map("assistant_actions")
+}
+
+/// 用量与预算（FR-12.15）。每人每天一行，用 upsert 累加
+model AssistantUsageDaily {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  statDate       DateTime @map("stat_date") @db.Date
+  requests       Int      @default(0)
+  tokensIn       Int      @default(0) @map("tokens_in")
+  tokensOut      Int      @default(0) @map("tokens_out")
+  failedRequests Int      @default(0) @map("failed_requests")
+  /// 估算成本（分），便于对账
+  costCents      Int      @default(0) @map("cost_cents")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, statDate])
+  @@map("assistant_usage_daily")
+}
+
+/// 助手个人设置（FR-12.9 自动执行级别 / FR-12.16 自定义指令 / FR-12.19 隐私模式）
+model AssistantSetting {
+  userId            String               @id @map("user_id") @db.Uuid
+  enabled           Boolean              @default(true)
+  /// 默认 ALWAYS_CONFIRM：任何写操作都要确认（已确认决策）
+  autoExecuteLevel  AssistantAutoExecute @default(ALWAYS_CONFIRM) @map("auto_execute_level")
+  /// 允许的工具白名单；为空表示用系统默认（危险工具永远不在其中）
+  allowedTools      Json?                @map("allowed_tools")
+  systemPromptExtra String?              @map("system_prompt_extra") @db.Text
+  privacyMode       AssistantPrivacyMode @default(FULL) @map("privacy_mode")
+  dailyTokenBudget  Int?                 @map("daily_token_budget")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("assistant_settings")
+}

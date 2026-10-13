@@ -1,0 +1,23 @@
+# 行尾统一策略：开发在 Windows、部署在 Linux，需要避免 CRLF 混入
+# 默认由 git 自动判断文本文件，检出时用 LF；Windows 专用脚本保持 CRLF
+* text=auto eol=lf
+
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 明确标记为二进制，避免被误当文本处理
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.xlsx  binary
+*.docx  binary
+
+# lockfile 不参与 diff 统计（但仍提交，保证依赖可复现）
+package-lock.json  -diff
+pnpm-lock.yaml     -diff

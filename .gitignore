@@ -1,0 +1,37 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+
+# 环境与本地密钥（含本机数据库凭据）
+.env
+.env.*
+!.env.example
+.local/
+
+# 上传与日志
+uploads/
+logs/
+*.log
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# 测试与缓存
+coverage/
+.nyc_output/
+.eslintcache
+.vite/
+
+# 本机环境 / 工具残留（DSH 沙箱、文件权限恢复记录等，与项目无关）
+.acl-recovery/
+.dsh-write-test.txt
+npm-debug.log*

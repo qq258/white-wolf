@@ -1,0 +1,24 @@
+{
+  "name": "@bailang/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "白狼工作待办系统 — 后端 API。当前阶段（任务 B）仅包含 Prisma 数据层，NestJS 应用骨架在 M0 补齐。",
+  "scripts": {
+    "prisma:format": "prisma format",
+    "prisma:validate": "prisma validate",
+    "prisma:generate": "prisma generate",
+    "migrate:dev": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "migrate:status": "prisma migrate status",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
